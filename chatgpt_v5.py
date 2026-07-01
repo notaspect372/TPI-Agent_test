@@ -17,7 +17,7 @@ import requests
 import hashlib
 import sys
 from docx import Document  
-
+from io import BytesIO
 load_dotenv()
 
 FIRST_PAGE_URL = {
