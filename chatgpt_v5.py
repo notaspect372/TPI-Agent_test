@@ -1,4 +1,3 @@
-
 from math import ceil
 import os
 import shutil
@@ -8,7 +7,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 import pandas as pd
 import streamlit as st
-from openai import AsyncOpenAI
 from groq import Groq
 import json
 from bs4 import BeautifulSoup
@@ -18,8 +16,7 @@ import io
 import requests
 import hashlib
 import sys
-from docx import Document  # New import for creating .docx files
-from io import BytesIO  # For handling in-memory file
+from docx import Document  
 
 load_dotenv()
 
@@ -32,9 +29,6 @@ FIRST_PAGE_URL = {
     "DVA Website Latest News":"https://www.dva.gov.au/about/news/latest-news"
 }
 
-# 
-
-OPENAI_API_KEY = API_KEY
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 CHAT_DIR = "chat_history"
@@ -229,34 +223,39 @@ def run_scraper(module_name, scraper_dir="scrapers"):
 
 import tiktoken
 
-groq_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+# ——— Available Groq models ———
+GROQ_MODELS = {
+    "Llama 4 Scout (17B)": "meta-llama/llama-4-scout-17b-16e-instruct",
+    "Llama 3.3 70B": "llama-3.3-70b-versatile",
+    "Llama 3.1 8B (fast)": "llama-3.1-8b-instant",
+}
 
 async def ask_agent(csv_text: str, question: str, model: str, chat_history: list) -> str:
-    use_groq = model.startswith("meta-llama/")
+    # Token counting (tiktoken doesn't know Groq model names, so use a generic encoding)
     try:
         encoding = tiktoken.encoding_for_model(model)
     except KeyError:
-        encoding = tiktoken.get_encoding("p50k_base" if use_groq else "cl100k_base")
+        encoding = tiktoken.get_encoding("cl100k_base")
 
     def count_tokens(text: str) -> int:
         return len(encoding.encode(text))
 
     system_prompt = (
-        "You are ChatGPT — a helpful, intelligent, and articulate AI assistant. "
-        "Engage with the user naturally, just like ChatGPT does. You can answer questions, explain concepts, write summaries or articles, and offer insights or ideas. "
-        "Use the provided CSV dataset when it’s relevant, referencing specific rows or columns to support your answers — but you're not restricted to it. "
+        "You are a helpful, intelligent, and articulate AI assistant. "
+        "Engage with the user naturally. You can answer questions, explain concepts, write summaries or articles, and offer insights or ideas. "
+        "Use the provided CSV dataset when it's relevant, referencing specific rows or columns to support your answers — but you're not restricted to it. "
         "Always consider the full conversation history to give context-aware, coherent, and smart responses. "
         "Be clear, creative, and conversational. If information is missing or uncertain, say so honestly instead of guessing."
     )
-
 
     history_context = "".join(
         f"{('User' if m['role']=='user' else 'Assistant')}: {m['content']}\n\n"
         for m in chat_history
     )
 
-    MODEL_MAX = 16385
-    HEADROOM = 512
+    # Groq context windows are generally large; keep a conservative usable budget
+    MODEL_MAX = 32000
+    HEADROOM = 1024
     usable_tokens = MODEL_MAX - HEADROOM
 
     static_tokens = (
@@ -267,24 +266,11 @@ async def ask_agent(csv_text: str, question: str, model: str, chat_history: list
         + count_tokens(question)
     )
 
-    async def send_chat(prompt: str) -> str:
-        client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        return resp.choices[0].message.content.strip()
-
-
     async def send_groq(prompt: str) -> str:
         def run_sync():
             client = Groq(api_key=os.getenv("GROQ_API_KEY"))
             resp = client.chat.completions.create(
-                model=groq_model,
+                model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
@@ -302,11 +288,11 @@ async def ask_agent(csv_text: str, question: str, model: str, chat_history: list
 
     full_prompt = make_prompt(csv_text)
     if static_tokens + count_tokens(full_prompt) <= usable_tokens:
-        return await (send_groq(full_prompt) if use_groq else send_chat(full_prompt))
+        return await send_groq(full_prompt)
 
     lines = csv_text.split("\n")
     header, rows = lines[0], lines[1:]
-    avg_tokens_per_row = max(1, count_tokens("\n".join(rows)) // len(rows))
+    avg_tokens_per_row = max(1, count_tokens("\n".join(rows)) // max(1, len(rows)))
     rows_per_chunk = max(1, (usable_tokens - static_tokens) // avg_tokens_per_row)
 
     while True:
@@ -321,14 +307,14 @@ async def ask_agent(csv_text: str, question: str, model: str, chat_history: list
     partials = []
     for chunk in chunks:
         prompt = make_prompt(header + "\n" + "\n".join(chunk))
-        part = await (send_groq(prompt) if use_groq else send_chat(prompt))
+        part = await send_groq(prompt)
         partials.append(part)
 
     synthesis = (
         "Please combine the following partial responses into a single, well-structured answer to the user's question:\n\n"
         + "\n---\n".join(partials)
     )
-    return await (send_groq(synthesis) if use_groq else send_chat(synthesis))
+    return await send_groq(synthesis)
 
 # ——— Function to create .docx file ———
 def create_docx(content: str) -> BytesIO:
@@ -359,7 +345,11 @@ def main():
     if "query" not in st.session_state:
         st.session_state["query"] = ""
 
-    st.sidebar.image("logo.png", width=200)
+    if os.path.exists("logo.png"):
+        st.sidebar.image("logo.png", width=200)
+
+    if not os.getenv("GROQ_API_KEY"):
+        st.sidebar.error("⚠️ GROQ_API_KEY is not set. Add it in your environment variables.")
 
     scrapers = list_scrapers()
     choice = st.sidebar.selectbox("Select Source", scrapers)
@@ -385,13 +375,12 @@ def main():
         else:
             st.sidebar.error("Scraper did not return a DataFrame.")
 
-    raw_model = st.sidebar.selectbox(
-        "Model",
-        ["gpt-3.5-turbo-16k", "Groq"],
+    model_label = st.sidebar.selectbox(
+        "Model (Groq)",
+        list(GROQ_MODELS.keys()),
         key="model_select"
     )
-    model = raw_model if raw_model != "Groq" else "meta-llama/llama-4-scout-17b-16e-instruct"
-
+    model = GROQ_MODELS[model_label]
 
     files = sorted(
         [f for f in os.listdir("data") if f.lower().endswith(".csv")],
@@ -435,13 +424,6 @@ def main():
         st.session_state.chat_id = chats[idx]["id"]
         st.session_state.chat_history = chats[idx]["messages"].copy()
 
-    # raw_model = st.sidebar.selectbox(
-    #     "Model",
-    #     ["gpt-3.5-turbo-16k", "Groq"],
-    #     key="model_select"
-    # )
-    # model = raw_model if raw_model != "Groq" else "meta-llama/llama-4-scout-17b-16e-instruct"
-
     st.subheader(f"Dataset: {sel_file}")
     st.dataframe(df)
     st.markdown("---")
@@ -467,27 +449,30 @@ def main():
         query = st.text_input("Ask anything—article, summary, insight…", key="query")
         submitted = st.form_submit_button("Ask Agent")
         if submitted and query:
-            st.session_state.chat_history.append({"role": "user", "content": query})
-            csv_text = df.to_csv(index=False)
-            with st.spinner("🤖 Agent is thinking..."):
-                answer = asyncio.run(ask_agent(csv_text, query, model, st.session_state.chat_history))
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
-            csv_basename = os.path.splitext(sel_file)[0]
-            if st.session_state.get("new_chat_title") is None:
-                st.session_state["new_chat_title"] = query[:50]  # Trim if too long
+            if not os.getenv("GROQ_API_KEY"):
+                st.error("GROQ_API_KEY is not set. Cannot contact the model.")
+            else:
+                st.session_state.chat_history.append({"role": "user", "content": query})
+                csv_text = df.to_csv(index=False)
+                with st.spinner("🤖 Agent is thinking..."):
+                    answer = asyncio.run(ask_agent(csv_text, query, model, st.session_state.chat_history))
+                st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                csv_basename = os.path.splitext(sel_file)[0]
+                if st.session_state.get("new_chat_title") is None:
+                    st.session_state["new_chat_title"] = query[:50]  # Trim if too long
 
-            chat_title = st.session_state["new_chat_title"]
+                chat_title = st.session_state["new_chat_title"]
 
-            new_id = save_chat(
-                st.session_state.chat_history,
-                chat_id=st.session_state.get("chat_id"),
-                title=chat_title
-            )
-            st.session_state.chat_id = new_id
-            try:
-                st.experimental_rerun()
-            except AttributeError:
-                st.rerun()
+                new_id = save_chat(
+                    st.session_state.chat_history,
+                    chat_id=st.session_state.get("chat_id"),
+                    title=chat_title
+                )
+                st.session_state.chat_id = new_id
+                try:
+                    st.experimental_rerun()
+                except AttributeError:
+                    st.rerun()
 
     # ——— Display Chat with Download Buttons ———
     for i, msg in enumerate(st.session_state.chat_history):
